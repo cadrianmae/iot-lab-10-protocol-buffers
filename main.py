@@ -1,14 +1,13 @@
 """
-Lab 9: Unified MQTT Publisher/Subscriber
+Lab 10: Protocol Buffers - main.py
+Unified MQTT Publisher/Subscriber
 Single codebase that runs as either publisher or subscriber based on global config.
-
-Using time.time() for epoch timestamps. Instead of RTC for simple time comparisons.
-
-Author: Mae Capacite (C21348423)
-Module: CMPU 4100 - Fundamentals of IoT
-Date: 2025-12-03
+Uses Protocol Buffers (proto2) for efficient binary message serialization.
+Author: Mae Capacite
+Date: 06 / 12 / 2025
 """
 import machine, time, network
+import sensor_upb2 as pb
 
 # ==== Global Configuration ====
 
@@ -244,6 +243,7 @@ class PiMQTTPub(PiMQTT):
         assert self.publish_interval is not None, "Publish interval not set."
         assert self.on_get_data is not None, "on_get_data callback not set."
         assert self.mqtt is not None, "MQTT client not connected."
+        assert self.topic is not None, "MQTT topic not set."
 
         try:
             while True:
@@ -253,8 +253,9 @@ class PiMQTTPub(PiMQTT):
                     self.log.warn("No data callback set")
                     continue
 
-                self.mqtt.publish(self.topic, payload.encode())
-                self.log.debug(f"Published: {payload} to {self.topic.decode()}")
+                # Protobuf returns bytes directly, no encode needed
+                self.mqtt.publish(self.topic, payload)
+                self.log.debug(f"Published {len(payload)} bytes to {self.topic.decode()}")
                 time.sleep(self.publish_interval)
         except KeyboardInterrupt:
             self.log.info("Publisher interrupted by user")
@@ -277,6 +278,7 @@ class PiMQTTSub(PiMQTT):
         """Internal run method for subscriber."""
         assert self.mqtt is not None, "MQTT client not connected."
         assert self.on_message is not None, "on_message callback not set."
+        assert self.topic is not None, "MQTT topic not set."
 
         self.mqtt.set_callback(self.on_message)
         self.mqtt.subscribe(self.topic)
@@ -294,12 +296,21 @@ def publisher_loop(system: System):
     publisher.set_config(PUB_IDENT, BROKER_IP, 1883, TOPIC, publish_interval=10)
 
     def on_get_data():
-        """Get data to publish - temperature and epoch timestamp."""
+        """Get data to publish - temperature and time as protobuf."""
         temp = system.read_temp()
-        timestamp = system.get_timestamp()  # epoch seconds
-        payload = f"{PUB_IDENT.decode()},{temp:.2f},{timestamp}"
-        log.debug(f"Publishing: {payload}")
-        return payload
+        current_time = system.get_current_time()  # (year, month, day, weekday, hour, min, sec, subsec)
+
+        time_msg = pb.TimeMessage()
+        time_msg.hour.setValue(current_time[4])
+        time_msg.minute.setValue(current_time[5])
+        time_msg.second.setValue(current_time[6])
+
+        sensor_msg = pb.SensorreadingMessage()
+        sensor_msg.publisher_id.setValue(PUB_IDENT)
+        sensor_msg.temperature.setValue(temp)
+        sensor_msg.time.setValue(time_msg)
+
+        return sensor_msg.serialize()
 
     publisher.set_callbacks(on_get_data=on_get_data)
 
@@ -315,31 +326,29 @@ def subscriber_loop(system: System):
 
 
     def process_message(topic, msg):
-        """Process incoming MQTT message."""
-        topic = topic.decode()
-        payload = msg.decode()
+        """Process incoming MQTT message (protobuf)."""
+        topic_str = topic.decode()
 
-        parts = payload.split(',')
-        if len(parts) != 3:
-            log.error("Invalid payload format")
-            return
+        sensor_msg = pb.SensorreadingMessage()
+        sensor_msg.parse(msg)
 
-        try:
-            pub_ident = parts[0]
-            temp = float(parts[1])
-            timestamp = parts[2]
-        except ValueError:
-            log.error("Error parsing payload values")
-            return
+        pub_ident = sensor_msg.publisher_id._value
+        temp = sensor_msg.temperature._value
+        time_msg = sensor_msg.time._value  # Nested TimeMessage
+        hour = time_msg.hour._value
+        minute = time_msg.minute._value
+        second = time_msg.second._value
 
-        log.info(f"Device: {pub_ident}, Temp: {temp:.2f}C, Time: {timestamp}")
+        # For simplicity, use current system timestamp
+        timestamp = system.get_timestamp()
 
-        return (pub_ident, temp, timestamp)
+        log.debug(f"Received message on {topic_str}: pub_id={pub_ident.decode()}, temp={temp:.2f}C, time={hour}:{minute}:{second}")
+        return (pub_ident, temp, timestamp, hour, minute, second)
 
     window_size = 10 * 60  # 10 minutes in seconds 
 
     # map of data from devices - stores messages in last 10 mins
-    # pub_ident -> list of (timestamp, temp)
+    # pub_ident -> list of (timestamp, temp, hour, minute, second)
     data = {}
         
     def save_data(data_tuple):
@@ -348,12 +357,10 @@ def subscriber_loop(system: System):
             log.warn("No data to save")
             return
 
-        current_time = system.get_timestamp()
-
-        pub_ident, temp, _ = data_tuple
+        pub_ident, temp, timestamp, hour, minute, second = data_tuple
 
         try:
-            message_time = int(data_tuple[2])
+            message_time = int(timestamp)
         except ValueError:
             log.error("Invalid timestamp format")
             return
@@ -362,8 +369,8 @@ def subscriber_loop(system: System):
         if pub_ident not in data:
             data[pub_ident] = []
 
-        # Save new data point
-        data[pub_ident].append((message_time, temp))
+        # Save new data point with RTC time
+        data[pub_ident].append((message_time, temp, hour, minute, second))
 
         log.debug(f"Data for {pub_ident}: {data[pub_ident]}")
 
@@ -373,8 +380,8 @@ def subscriber_loop(system: System):
 
         for pub_ident in data:
             old_len = len(data[pub_ident])
-            data[pub_ident] = [(ts, t) for ts, t in data[pub_ident]
-                               if current_time - ts <= window_size]
+            data[pub_ident] = [entry for entry in data[pub_ident]
+                               if current_time - entry[0] <= window_size]
             removed = old_len - len(data[pub_ident])
             if removed > 0:
                 log.debug(f"Removed {removed} old data points for {pub_ident}")
@@ -388,11 +395,13 @@ def subscriber_loop(system: System):
             if not data_points:
                 continue
             # Get most recent reading for this publisher
-            latest_ts, latest_temp = data_points[-1]
+            # Format: (timestamp, temp, hour, minute, second)
+            latest_entry = data_points[-1]
+            latest_ts, latest_temp = latest_entry[0], latest_entry[1]
             # Only include if within window
             if current_time - latest_ts <= window_size:
                 latest_temps.append(latest_temp)
-                log.debug(f"Latest from {pub_ident}: {latest_temp:.2f}C")
+                log.debug(f"Latest from {pub_ident}: {latest_temp:.2f}C at {latest_entry[2]:02d}:{latest_entry[3]:02d}:{latest_entry[4]:02d}")
 
         if not latest_temps:
             log.info("No active publishers in the last 10 minutes")
