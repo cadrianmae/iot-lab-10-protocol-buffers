@@ -1,0 +1,20 @@
+/*
+  Lab 10 Protocol Buffers - sensor.proto
+  Proto2 Schema Definition for Sensor Readings
+  Author: Mae Capacite
+  Date: 06 / 12 / 2025
+*/
+
+syntax = "proto2";
+
+message Time {
+    required uint32 hour = 1;
+    required uint32 minute = 2;
+    required uint32 second = 3;
+}
+
+message SensorReading {
+    required string publisher_id = 1;
+    required float temperature = 2;
+    required Time time = 3;
+}
